@@ -1,0 +1,15 @@
+# Build artifacts
+_work/
+*.ipa
+YouTube-patched.ipa
+
+# Temp folders downloaded during build
+Extensions/
+Tweaks/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

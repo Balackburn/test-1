@@ -1,0 +1,561 @@
+# build.yml — Simplified Data-Driven Workflow for YTLitePlus
+# Single IPA variant, uses simplified analyzer
+
+name: Build YTLitePlus
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct URL to decrypted YouTube IPA"
+        required: true
+        type: string
+      create_release:
+        description: "Create GitHub Release"
+        type: boolean
+        default: true
+      reanalyze_tweaks:
+        description: "Re-run analyzer.py to update config.json"
+        type: boolean
+        default: false
+      app_name:
+        description: "Modify the app's name (default: YouTube)"
+        required: false
+        type: string
+        default: ""
+      app_version:
+        description: "Modify the app's version"
+        required: false
+        type: string
+        default: ""
+      bundle_id:
+        description: "Modify the app's bundle ID (default: com.google.ios.youtube)"
+        required: false
+        type: string
+        default: ""
+      minimum_ios:
+        description: "Modify the app's minimum iOS version"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.13'
+  PYZULE_RW_URL: "https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip"
+
+jobs:
+  build:
+    name: Build YTLitePlus
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ────────────────────────────────────────────────────────
+      # Setup
+      # ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+
+      - name: Install dependencies
+        run: |
+          # Python dependencies
+          python -m pip install --upgrade pip
+          pip install --force-reinstall "${{ env.PYZULE_RW_URL }}"
+          
+          # System dependencies
+          brew install ldid make
+
+      - name: Set up Theos
+        run: |
+          git clone --depth=1 https://github.com/theos/theos.git ${{ github.workspace }}/theos
+          git -C ${{ github.workspace }}/theos submodule update --init --recursive || true
+          echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
+
+      - name: Download iOS SDK
+        run: |
+          git clone --quiet -n --depth=1 --filter=tree:0 https://github.com/Tonwalter888/iOS-SDKs.git /tmp/iOS-SDKs
+          cd /tmp/iOS-SDKs
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv iPhoneOS16.5.sdk ${{ github.workspace }}/theos/sdks/
+
+      - name: Setup required headers
+        run: |
+          # YouTubeHeader (required by most YouTube tweaks)
+          git clone --quiet --depth=1 https://github.com/PoomSmart/YouTubeHeader.git \
+            ${{ github.workspace }}/theos/include/YouTubeHeader
+          
+          # PSHeader (common dependency)
+          git clone --quiet --depth=1 https://github.com/PoomSmart/PSHeader.git \
+            ${{ github.workspace }}/theos/include/PSHeader
+          
+          # YTHeaders (for DontEatMyContent if present)
+          git clone --quiet --depth=1 https://github.com/therealFoxster/YTHeaders.git \
+            ${{ github.workspace }}/theos/include/YTHeaders
+
+      # ────────────────────────────────────────────────────────
+      # Analyze configuration
+      # ────────────────────────────────────────────────────────
+      - name: Run analyzer (if requested)
+        if: ${{ inputs.reanalyze_tweaks }}
+        run: |
+          python scripts/analyzer.py
+          
+          # Commit updated config if changes detected
+          if git diff --quiet config.json; then
+            echo "No config changes"
+          else
+            echo "Config updated by analyzer"
+            git config --local user.name "GitHub Actions"
+            git config --local user.email "actions@github.com"
+            git add config.json
+            git commit -m "chore: update config.json via analyzer"
+            git push || echo "Failed to push config update (continuing anyway)"
+          fi
+
+      - name: Load configuration
+        id: config
+        run: |
+          # Extract key info from config.json
+          TWEAK_COUNT=$(python3 -c "import json; print(len(json.load(open('config.json'))['config']))")
+          BUILD_ORDER=$(python3 -c "import json; print(','.join(json.load(open('config.json'))['build_order']))")
+          
+          echo "tweak_count=$TWEAK_COUNT" >> $GITHUB_OUTPUT
+          echo "build_order=$BUILD_ORDER" >> $GITHUB_OUTPUT
+          
+          echo "📦 Building $TWEAK_COUNT tweaks in order: $BUILD_ORDER"
+
+      # ────────────────────────────────────────────────────────
+      # Download and validate IPA
+      # ────────────────────────────────────────────────────────
+      - name: Download and validate YouTube IPA
+        run: |
+          echo "Downloading IPA from ${{ inputs.ipa_url }}"
+          curl -L "${{ inputs.ipa_url }}" -o YouTube.ipa
+          
+          # Validate file type
+          file_type=$(file --mime-type -b YouTube.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Invalid IPA file type: $file_type"
+            exit 1
+          fi
+          
+          # Extract version from IPA
+          YT_VERSION=$(unzip -p YouTube.ipa 'Payload/*.app/Info.plist' | \
+            grep -A1 'CFBundleShortVersionString' | \
+            grep string | \
+            sed -E 's/<string>(.*)<\/string>/\1/' | \
+            tr -d '[:space:]')
+          
+          echo "YouTube version: $YT_VERSION"
+          echo "YT_VERSION=$YT_VERSION" >> $GITHUB_ENV
+
+      # ────────────────────────────────────────────────────────
+      # Build tweaks dynamically from config
+      # ────────────────────────────────────────────────────────
+      - name: Build tweaks from config
+        run: |
+          #!/bin/bash
+          # DON'T use 'set -e' - we want to continue on individual tweak failures
+          
+          # Create build workspace
+          mkdir -p tweaks_built
+          
+          # Track build status
+          declare -a FAILED_TWEAKS=()
+          declare -a SUCCESS_TWEAKS=()
+          
+          # Symlink theos header repos into /tmp so that sibling-relative
+          # #import paths like "../YouTubeHeader/Foo.h" resolve correctly
+          for hdr_dir in "$THEOS/include/YouTubeHeader" "$THEOS/include/PSHeader" "$THEOS/include/YTHeaders"; do
+            hdr_name=$(basename "$hdr_dir")
+            [ -d "$hdr_dir" ] && [ ! -e "/tmp/$hdr_name" ] && ln -sf "$hdr_dir" "/tmp/$hdr_name"
+          done
+          
+          # Read config
+          CONFIG=$(cat config.json)
+          BUILD_ORDER=$(echo "$CONFIG" | python3 -c "import sys, json; print(' '.join(json.load(sys.stdin)['build_order']))")
+          
+          echo "🔨 Building tweaks in dependency order..."
+          
+          for tweak_id in $BUILD_ORDER; do
+            echo ""
+            echo "═══════════════════════════════════════"
+            echo "Building: $tweak_id"
+            echo "═══════════════════════════════════════"
+            
+            # Wrap entire build in a subshell to catch errors
+            (
+              set -e  # Exit subshell on error, but don't exit main script
+              
+              # Get tweak config using Python
+              CONFIG_JSON=$(python3 -c "import json; cfg=json.load(open('config.json')); print(json.dumps([c for c in cfg['config'] if c['id']=='$tweak_id'][0]))")
+              
+              repo=$(echo "$CONFIG_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['repo'])")
+              fetch=$(echo "$CONFIG_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin)['fetch'])")
+              build_cmd=$(echo "$CONFIG_JSON" | python3 -c "import sys, json; print(json.load(sys.stdin).get('build_cmd', 'make clean package DEBUG=0 FINALPACKAGE=1'))")
+              
+              echo "  Repo: $repo"
+              echo "  Fetch: $fetch"
+              
+              # Handle different fetch methods
+              case "$fetch" in
+                release)
+                  echo "  📥 Fetching latest release..."
+                  
+                  # Use the GitHub API so we reliably see all release assets
+                  # (the HTML releases page is JS-rendered and grep-based scraping misses files)
+                  RELEASE_JSON=$(curl -sf \
+                    -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$repo/releases/latest" || true)
+                  
+                  if [ -z "$RELEASE_JSON" ]; then
+                    echo "  ⚠️  GitHub API unreachable, building from source"
+                    fetch="build"
+                  else
+                    # Pull optional per-tweak filters from config.json
+                    DEB_FILTER=$(echo "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deb_filter',''))" 2>/dev/null || echo "")
+                    DEB_EXCLUDE=$(echo "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('deb_exclude',''))" 2>/dev/null || echo "")
+                    echo "    deb_filter='$DEB_FILTER'  deb_exclude='$DEB_EXCLUDE'"
+                    
+                    # Select best .deb: apply filter/exclude, fall back to first .deb available
+                    DEB_URL=$(echo "$RELEASE_JSON" | DEB_FILTER="$DEB_FILTER" DEB_EXCLUDE="$DEB_EXCLUDE" python3 -c "import sys,json,os; a=json.load(sys.stdin).get('assets',[]); f=os.environ.get('DEB_FILTER',''); e=os.environ.get('DEB_EXCLUDE',''); c=[x['browser_download_url'] for x in a if x['name'].endswith('.deb') and (not f or f in x['name']) and (not e or e not in x['name'])]; print(c[0] if c else '')")
+                    
+                    if [ -n "$DEB_URL" ]; then
+                      echo "  ✓ Found .deb: $(basename "$DEB_URL")"
+                      curl -fL "$DEB_URL" -o "tweaks_built/${tweak_id}.deb"
+                    else
+                      echo "  ⚠️  No matching .deb in release assets, building from source"
+                      fetch="build"
+                    fi
+                  fi
+                  ;;
+                
+                appex)
+                  echo "  📥 Fetching .appex..."
+                  
+                  # Auto-detect default branch (no API calls, uses git protocol)
+                  DEFAULT_BRANCH=$(git ls-remote --symref "https://github.com/$repo.git" HEAD | head -1 | sed 's|^ref: refs/heads/||; s|\tHEAD$||')
+                  echo "    Detected branch: $DEFAULT_BRANCH"
+                  
+                  # Clone using repo basename to preserve exact casing on disk
+                  CLONE_DIR="/tmp/$(basename "$repo")"
+                  git clone --quiet --depth=1 --recurse-submodules --branch "$DEFAULT_BRANCH" "https://github.com/$repo.git" "$CLONE_DIR"
+                  
+                  find "$CLONE_DIR" -name "*.appex" -type d -exec cp -R {} "tweaks_built/" \;
+                  echo "  ✓ Copied .appex bundle(s)"
+                  ;;
+              esac
+              
+              # Build from source if needed
+              if [ "$fetch" = "build" ]; then
+                echo "  🔨 Building from source..."
+                
+                # Auto-detect default branch (no API calls, uses git protocol)
+                DEFAULT_BRANCH=$(git ls-remote --symref "https://github.com/$repo.git" HEAD | head -1 | sed 's|^ref: refs/heads/||; s|\tHEAD$||')
+                echo "    Detected branch: $DEFAULT_BRANCH"
+                
+                # Clone using repo basename to preserve exact casing on disk
+                # (e.g. YTVideoOverlay not ytvideooverlay — macOS #import paths are case-sensitive to the compiler)
+                CLONE_DIR="/tmp/$(basename "$repo")"
+                git clone --quiet --depth=1 --recurse-submodules --branch "$DEFAULT_BRANCH" "https://github.com/$repo.git" "$CLONE_DIR"
+                
+                # Handle dependencies (get depends_on if exists)
+                DEPENDS_ON=$(echo "$CONFIG_JSON" | python3 -c "import sys, json; deps=json.load(sys.stdin).get('depends_on', []); print(' '.join(deps))" || echo "")
+                
+                if [ -n "$DEPENDS_ON" ]; then
+                  echo "  📦 Setting up dependencies: $DEPENDS_ON"
+                  for dep in $DEPENDS_ON; do
+                    dep_cfg=$(python3 -c "import json; cfg=json.load(open('config.json')); print(json.dumps([c for c in cfg['config'] if c['id']=='$dep'][0]))")
+                    dep_repo=$(echo "$dep_cfg" | python3 -c "import sys, json; print(json.load(sys.stdin)['repo'])")
+                    
+                    dep_name=$(basename "$dep_repo")
+                    if [ ! -d "/tmp/$dep_name" ]; then
+                      echo "    → Cloning $dep_repo"
+                      
+                      # Auto-detect default branch for dependency
+                      DEP_BRANCH=$(git ls-remote --symref "https://github.com/$dep_repo.git" HEAD | head -1 | sed 's|^ref: refs/heads/||; s|\tHEAD$||')
+                      echo "      Detected branch: $DEP_BRANCH"
+                      
+                      git clone --quiet --depth=1 --recurse-submodules --branch "$DEP_BRANCH" "https://github.com/$dep_repo.git" "/tmp/$dep_name"
+                    fi
+                  done
+                fi
+                
+                # Build the tweak
+                cd "$CLONE_DIR"
+                PRE_BUILD=$(echo "$CONFIG_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin).get('pre_build_cmd',''))" 2>/dev/null || echo "")
+                if [ -n "$PRE_BUILD" ]; then
+                  echo "  Pre-build: $PRE_BUILD"
+                  eval "$PRE_BUILD"
+                fi
+                echo "  Running: $build_cmd"
+                eval "$build_cmd"
+                
+                # Verify build output was created
+                BUILD_OUTPUT_FOUND=false
+                if [ -d "packages" ]; then
+                  if find packages -name "*.deb" -type f | grep -q .; then
+                    find packages -name "*.deb" -exec cp {} "${{ github.workspace }}/tweaks_built/${tweak_id}.deb" \;
+                    echo "  ✓ Built .deb"
+                    BUILD_OUTPUT_FOUND=true
+                  fi
+                fi
+                
+                # Ensure we fail if no output was created
+                if [ "$BUILD_OUTPUT_FOUND" = "false" ]; then
+                  echo "  ⚠️  Build command completed but no .deb output found"
+                  exit 1
+                fi
+                
+                cd "${{ github.workspace }}"
+              fi
+            ) && BUILD_SUCCESS=true || BUILD_SUCCESS=false
+            
+            # Track build result
+            if [ "$BUILD_SUCCESS" = "true" ]; then
+              echo "  ✅ $tweak_id complete"
+              SUCCESS_TWEAKS+=("$tweak_id")
+            else
+              echo "  ❌ $tweak_id FAILED"
+              FAILED_TWEAKS+=("$tweak_id")
+            fi
+          done
+          
+          echo ""
+          echo "═══════════════════════════════════════"
+          echo "📦 Build summary"
+          echo "═══════════════════════════════════════"
+          echo "✅ Successful: ${#SUCCESS_TWEAKS[@]}"
+          echo "❌ Failed: ${#FAILED_TWEAKS[@]}"
+          
+          if [ ${#FAILED_TWEAKS[@]} -gt 0 ]; then
+            echo ""
+            echo "Failed tweaks:"
+            for tweak in "${FAILED_TWEAKS[@]}"; do
+              echo "  - $tweak"
+            done
+          fi
+          
+          echo ""
+          echo "Built artifacts:"
+          ls -lh tweaks_built
+          
+          # Store failed tweaks for later steps
+          echo "FAILED_TWEAKS=${FAILED_TWEAKS[*]}" >> $GITHUB_ENV
+          echo "SUCCESS_COUNT=${#SUCCESS_TWEAKS[@]}" >> $GITHUB_ENV
+          echo "FAILED_COUNT=${#FAILED_TWEAKS[@]}" >> $GITHUB_ENV
+
+
+      # ────────────────────────────────────────────────────────
+      # Inject tweaks and create IPA
+      # ────────────────────────────────────────────────────────
+      - name: Build YTLitePlus IPA
+        run: |
+          mkdir -p build/Payload
+          
+          # Collect all built tweaks using absolute paths so they survive the `cd build` below
+          tweaks=()
+          for file in "${{ github.workspace }}/tweaks_built"/*; do
+            if [ -f "$file" ] || [ -d "$file" ]; then
+              tweaks+=("$file")
+              echo "Adding: $(basename "$file")"
+            fi
+          done
+          
+          echo ""
+          echo "Injecting ${#tweaks[@]} tweak(s) with cyan..."
+          
+          # Build cyan command with optional parameters
+          CYAN_CMD="cyan -i \"${{ github.workspace }}/YouTube.ipa\" -o \"Payload/YouTube.app\" -f \"\${tweaks[@]}\""
+          
+          # Add app name if provided, otherwise use default
+          if [ -n "${{ inputs.app_name }}" ]; then
+            CYAN_CMD="$CYAN_CMD -n \"${{ inputs.app_name }}\""
+            echo "✓ Custom app name: ${{ inputs.app_name }}"
+          else
+            CYAN_CMD="$CYAN_CMD -n \"YouTube\""
+          fi
+          
+          # Add version if provided
+          if [ -n "${{ inputs.app_version }}" ]; then
+            CYAN_CMD="$CYAN_CMD -v \"${{ inputs.app_version }}\""
+            echo "✓ Custom version: ${{ inputs.app_version }}"
+          fi
+          
+          # Add bundle ID if provided, otherwise use default
+          if [ -n "${{ inputs.bundle_id }}" ]; then
+            CYAN_CMD="$CYAN_CMD -b \"${{ inputs.bundle_id }}\""
+            echo "✓ Custom bundle ID: ${{ inputs.bundle_id }}"
+          else
+            CYAN_CMD="$CYAN_CMD -b \"com.google.ios.youtube\""
+          fi
+          
+          # Add minimum iOS version if provided
+          if [ -n "${{ inputs.minimum_ios }}" ]; then
+            CYAN_CMD="$CYAN_CMD -m \"${{ inputs.minimum_ios }}\""
+            echo "✓ Custom minimum iOS: ${{ inputs.minimum_ios }}"
+          fi
+          
+          # Add fakesign
+          CYAN_CMD="$CYAN_CMD --fakesign"
+          
+          # Inject with cyan
+          cd build
+          eval "$CYAN_CMD"
+          
+          # Create IPA
+          echo "Creating YTLitePlus.ipa..."
+          zip -9 -r YTLitePlus.ipa Payload
+          
+          # Move to workspace root
+          mv YTLitePlus.ipa "${{ github.workspace }}/"
+          
+          cd "${{ github.workspace }}"
+          echo ""
+          echo "✅ YTLitePlus.ipa created"
+          ls -lh YTLitePlus.ipa
+
+      # ────────────────────────────────────────────────────────
+      # Create release
+      # ────────────────────────────────────────────────────────
+      - name: Generate release info
+        id: release-info
+        run: |
+          RELEASE_TAG="v${{ env.YT_VERSION }}-$(date -u +'%Y%m%d.%H%M%S')"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> $GITHUB_OUTPUT
+          
+          SHA256=$(shasum -a 256 YTLitePlus.ipa | cut -d' ' -f1)
+          echo "SHA256=$SHA256" >> $GITHUB_OUTPUT
+
+      - name: Generate release notes
+        run: |
+          # Get list of tweaks from config
+          python3 << 'PYEOF' > tweaks_list.txt
+          import json
+          cfg = json.load(open('config.json'))
+          for c in cfg['config']:
+              print(f"- ✅ **{c['id']}** ({c['repo']}) - {c['fetch']}")
+          PYEOF
+          
+          TWEAKS_LIST=$(cat tweaks_list.txt)
+          
+          # Build customization section
+          CUSTOMIZATIONS=""
+          if [ -n "${{ inputs.app_name }}" ] || [ -n "${{ inputs.app_version }}" ] || [ -n "${{ inputs.bundle_id }}" ] || [ -n "${{ inputs.minimum_ios }}" ]; then
+            CUSTOMIZATIONS="## Customizations\n\n"
+            [ -n "${{ inputs.app_name }}" ] && CUSTOMIZATIONS="${CUSTOMIZATIONS}- **App Name:** \`${{ inputs.app_name }}\`\n"
+            [ -n "${{ inputs.app_version }}" ] && CUSTOMIZATIONS="${CUSTOMIZATIONS}- **App Version:** \`${{ inputs.app_version }}\`\n"
+            [ -n "${{ inputs.bundle_id }}" ] && CUSTOMIZATIONS="${CUSTOMIZATIONS}- **Bundle ID:** \`${{ inputs.bundle_id }}\`\n"
+            [ -n "${{ inputs.minimum_ios }}" ] && CUSTOMIZATIONS="${CUSTOMIZATIONS}- **Minimum iOS:** \`${{ inputs.minimum_ios }}\`\n"
+            CUSTOMIZATIONS="${CUSTOMIZATIONS}\n"
+          fi
+          
+          # Build failed tweaks section
+          FAILED_SECTION=""
+          if [ -n "${{ env.FAILED_TWEAKS }}" ]; then
+            FAILED_SECTION="## ⚠️ Build Failures\n\nThe following tweaks failed to build and are **not included** in this IPA:\n\n"
+            for tweak in ${{ env.FAILED_TWEAKS }}; do
+              FAILED_SECTION="${FAILED_SECTION}- ❌ **${tweak}**\n"
+            done
+            FAILED_SECTION="${FAILED_SECTION}\n**Note:** This IPA was built with ${{ env.SUCCESS_COUNT }} out of ${{ steps.config.outputs.tweak_count }} tweaks.\n\n"
+          fi
+          
+          # Use printf to properly handle newlines in variables
+          {
+            echo "# YTLitePlus"
+            echo ""
+            echo "**YouTube Version:** \`${{ env.YT_VERSION }}\`"
+            echo "**Build Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo "**Tweaks:** ${{ env.SUCCESS_COUNT }} successful / ${{ steps.config.outputs.tweak_count }} total"
+            echo ""
+            printf "%b" "$FAILED_SECTION"
+            printf "%b" "$CUSTOMIZATIONS"
+            echo "## Included Tweaks"
+            echo ""
+            cat tweaks_list.txt
+            echo ""
+            echo "## Build Order"
+            echo ""
+            echo "\`\`\`"
+            echo "${{ steps.config.outputs.build_order }}"
+            echo "\`\`\`"
+            echo ""
+            echo "## Installation"
+            echo ""
+            echo "- **AltStore/Sideloadly**: Direct install"
+            echo "- **TrollStore**: Use fakesigned IPA"
+            echo ""
+            echo "## Checksums"
+            echo ""
+            echo "**SHA256:** \`${{ steps.release-info.outputs.SHA256 }}\`"
+            echo ""
+            echo "---"
+            echo ""
+            echo "Built with data-driven workflow using config.json"
+          } > RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release-info.outputs.RELEASE_TAG }}
+          name: "YTLitePlus ${{ env.YT_VERSION }}"
+          body_path: RELEASE_NOTES.md
+          files: YTLitePlus.ipa
+          draft: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ────────────────────────────────────────────────────────
+      # Summary
+      # ────────────────────────────────────────────────────────
+      - name: Job Summary
+        run: |
+          echo "### 📺 YTLitePlus Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**YouTube Version:** \`${{ env.YT_VERSION }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tweaks:** ${{ env.SUCCESS_COUNT }} successful / ${{ steps.config.outputs.tweak_count }} total" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Order:** \`${{ steps.config.outputs.build_order }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add build status
+          if [ "${{ env.FAILED_COUNT }}" -gt 0 ]; then
+            echo "### ⚠️ Build Status" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **Successful builds:** ${{ env.SUCCESS_COUNT }}" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Failed builds:** ${{ env.FAILED_COUNT }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Failed tweaks:**" >> $GITHUB_STEP_SUMMARY
+            for tweak in ${{ env.FAILED_TWEAKS }}; do
+              echo "- ❌ ${tweak}" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Add customizations if any were made
+          if [ -n "${{ inputs.app_name }}" ] || [ -n "${{ inputs.app_version }}" ] || [ -n "${{ inputs.bundle_id }}" ] || [ -n "${{ inputs.minimum_ios }}" ]; then
+            echo "### 🎨 Customizations" >> $GITHUB_STEP_SUMMARY
+            [ -n "${{ inputs.app_name }}" ] && echo "- **App Name:** \`${{ inputs.app_name }}\`" >> $GITHUB_STEP_SUMMARY
+            [ -n "${{ inputs.app_version }}" ] && echo "- **App Version:** \`${{ inputs.app_version }}\`" >> $GITHUB_STEP_SUMMARY
+            [ -n "${{ inputs.bundle_id }}" ] && echo "- **Bundle ID:** \`${{ inputs.bundle_id }}\`" >> $GITHUB_STEP_SUMMARY
+            [ -n "${{ inputs.minimum_ios }}" ] && echo "- **Minimum iOS:** \`${{ inputs.minimum_ios }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "**SHA256:** \`${{ steps.release-info.outputs.SHA256 }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.create_release }}" = "true" ]; then
+            echo "🎉 Draft release created at [Releases page](../../releases)" >> $GITHUB_STEP_SUMMARY
+          fi
