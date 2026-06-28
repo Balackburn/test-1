@@ -10,6 +10,20 @@ as a static site on GitHub Pages.
   2. Browse the available fonts under this family, using the download button to save them to your machine.
   3. That's it.
 
+### Download options
+Each weight has its own download button (saves a single `.ttf`). For the whole
+family/collection there are two buttons:
+
+  * **Download All (.zip)** — every weight in one `.zip`, with the original font
+    names left untouched (exactly as Adobe serves them).
+  * **Merge into one family (.zip)** — every weight in one `.zip`, but rewritten
+    so they all share a single family name with the weight as the style. Instead
+    of installing as separate families ("Futura PT Light", "Futura PT Bold", …)
+    they install and group as **one** family ("Futura PT") whose styles are
+    Light, Bold, etc. Only the font's `name` table is changed — glyphs, kerning
+    and OpenType features are preserved byte-for-byte. Grouping relies on the
+    typographic family name, which macOS, Adobe apps and Microsoft Office honour.
+
 ### Terms
 * Do not use any downloaded fonts for anything other than testing purposes. Think of it like a try-before-you-buy system. This tool merely saves a copy of what Adobe makes publicly available through their website, but this does not give you the _legal right_ to use the fonts as if you have purchased a license. If you want to publish any work using these fonts, or do _anything_ restricted to license-holders by said license, you _must_ purchase a license through Adobe.
 

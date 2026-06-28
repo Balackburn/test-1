@@ -19,7 +19,7 @@ import { FontSet } from './models/fontset.js'
   <article>
     <div class="grid">
       <MessageBox v-if="message_is_visible" :title="message_title" :htmlContent="message_text" />
-      <FontsetContainer v-if="active_font_group" :fontset="active_font_group" v-on:download="download" />
+      <FontsetContainer v-if="active_font_group" :fontset="active_font_group" :downloading="downloading" v-on:download="download" />
     </div>
   </article>
 </template>
@@ -31,6 +31,7 @@ export default {
     message_title: "TypeRip",
     message_text: "<p><strong>The <a href='https://fonts.adobe.com/'>Adobe Fonts</a> ripper</strong></p><p>Updated January 2024</p><br/><p>Enter a Font Family or Font Pack URL from <a href='https://fonts.adobe.com/'>Adobe Fonts</a> to begin.</p><p>By using this tool, you agree to not violate copyright law or licenses established by the font owners, font foundries and/or Adobe. All fonts belong to their respective owners.</p><br><p>Having an issue? Report it on <a href='https://github.com/CodeZombie/TypeRip'>GitHub</a></p>",
     active_font_group: null,
+    downloading: false,
   }),
 
   methods: {
@@ -72,8 +73,16 @@ export default {
       this.active_font_group = font_group
     },
 
-    download(fonts, family_name) {
-      TypeRip.downloadFontsAsZip(fonts, family_name)
+    async download(fonts, family_name, mode) {
+      if (this.downloading) return
+      this.downloading = true
+      try {
+        await TypeRip.download(fonts, family_name, mode)
+      } catch (e) {
+        this.display_message("Download Failed", "Something went wrong while preparing your fonts. Please try again. (" + (e && e.message ? e.message : e) + ")")
+      } finally {
+        this.downloading = false
+      }
     }
   }
 }

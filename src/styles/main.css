@@ -146,6 +146,10 @@ header #url_input {
 }
 .button_container {
     padding:1rem;
+    display:flex;
+    flex-wrap:wrap;
+    gap:0.5rem;
+    align-items:center;
 }
 
 .button_container .button{
@@ -166,6 +170,12 @@ header #url_input {
     background: #005DFF;
     color: #fff;
     cursor: pointer;
+}
+
+.button_container .button.disabled{
+    opacity: 0.5;
+    pointer-events: none;
+    cursor: default;
 }
 
 footer p, footer a, footer a:active{

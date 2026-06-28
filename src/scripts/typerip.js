@@ -1,5 +1,7 @@
 import axios from 'axios';
 import saveAs from 'file-saver';
+import JSZip from 'jszip';
+import { renameFontFamily } from './fontTools.js';
 // NOTE: wawoff2 (the WOFF2 -> TTF decompressor) is intentionally NOT imported at
 // the top level. A static cross-origin import makes the whole app fail to boot
 // (blank page) whenever the CDN is slow or unreachable. It is loaded lazily from
@@ -306,11 +308,57 @@ export default class TypeRip {
         })
     }
 
-    static async downloadFontsAsZip(fonts, zipfile_name){
-        for(var i = 0; i < fonts.length; i++) {
-            var file = await this.getFontFile(fonts[i])
-            saveAs(new Blob([file]), fonts[i].name + ".ttf");
+    // Strip characters that are illegal in file names on common OSes.
+    static sanitizeFileName(name) {
+        return (name || "font").replace(/[\\/:*?"<>|]/g, "_").trim() || "font";
+    }
+
+    // Entry point used by the UI. `mode`:
+    //   'single' -> save the one font as a .ttf (original names)
+    //   'zip'    -> save every font in a single .zip (original names)
+    //   'unify'  -> save every font in a single .zip, all renamed to share one
+    //               family name so they install/group as one family
+    static download(fonts, name, mode) {
+        if (mode === "single") {
+            return this.downloadSingleFont(fonts[0]);
         }
+        return this.downloadFontsAsZip(fonts, name, { unify: mode === "unify" });
+    }
+
+    static async downloadSingleFont(font) {
+        const file = await this.getFontFile(font, false);
+        saveAs(new Blob([file]), this.sanitizeFileName(font.name) + ".ttf");
+    }
+
+    // Fetch every font, optionally merge them under one family name, and save the
+    // whole set as a single .zip archive.
+    static async downloadFontsAsZip(fonts, zipfile_name, options = {}) {
+        const unify = !!options.unify;
+        const zip = new JSZip();
+        const usedNames = new Set();
+
+        for (let i = 0; i < fonts.length; i++) {
+            const file = await this.getFontFile(fonts[i], unify);
+
+            // In unify mode name the file "<Family> <Style>.ttf"; otherwise keep
+            // the font's own display name. De-duplicate so nothing is overwritten
+            // inside the archive.
+            const baseName = this.sanitizeFileName(
+                unify
+                    ? `${fonts[i].familyName || zipfile_name} ${fonts[i].style || ""}`.trim()
+                    : fonts[i].name
+            );
+            let fileName = baseName + ".ttf";
+            for (let n = 2; usedNames.has(fileName); n++) {
+                fileName = `${baseName} ${n}.ttf`;
+            }
+            usedNames.add(fileName);
+
+            zip.file(fileName, file);
+        }
+
+        const blob = await zip.generateAsync({ type: "blob", compression: "DEFLATE" });
+        saveAs(blob, this.sanitizeFileName(zipfile_name) + ".zip");
     }
 
     static async convertWoff2ToTTF(woff2Uint8Array) {
@@ -326,8 +374,19 @@ export default class TypeRip {
         return Module.decompress(woff2Uint8Array)
     }
 
-    static async getFontFile(font) {
+    static async getFontFile(font, unify = false) {
         let response = await axios.get(font.url, {responseType: 'arraybuffer'})
-        return this.convertWoff2ToTTF(new Uint8Array(response.data));
+        let ttf = await this.convertWoff2ToTTF(new Uint8Array(response.data));
+
+        // Ensure we have a real Uint8Array for the (optional) name-table rewrite
+        // and for Blob/JSZip.
+        if (!(ttf instanceof Uint8Array)) {
+            ttf = new Uint8Array(ttf);
+        }
+
+        if (unify && font.familyName) {
+            ttf = renameFontFamily(ttf, font.familyName, font.style || "Regular");
+        }
+        return ttf;
     }
 }

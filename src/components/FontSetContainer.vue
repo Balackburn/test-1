@@ -10,24 +10,26 @@
                     </p>
                 </div>
                 <div class="button_container">
-                    <a class="button" v-on:click="download(fontset.fonts, fontset.name)">Download All</a>
+                    <a class="button" :class="{ disabled: downloading }" v-on:click="download(fontset.fonts, fontset.name, 'zip')">{{ downloading ? 'Preparing…' : 'Download All (.zip)' }}</a>
+                    <a class="button" :class="{ disabled: downloading }" v-on:click="download(fontset.fonts, fontset.name, 'unify')" title="Renames every weight to share one family name so they install and group as a single family (Futura → Light, Bold, … instead of separate families).">{{ downloading ? 'Preparing…' : 'Merge into one family (.zip)' }}</a>
                 </div>
             </div>
-        </div>   
+        </div>
     </div>
     <div class="row" v-for="(chunk, c_key) in getFontsInChunks(3)">
-        <FontBox v-for="(font, f_key) in chunk" v-bind:key="(c_key * 3) + f_key" v-on:download="download([font], font.name)" v-bind:fontname="font.name" v-bind:fontstyle="font.style" v-bind:fonturl="font.url" v-bind:sampletext="fontset.sampletext" v-bind:familyurl="font.familyUrl"></FontBox>
+        <FontBox v-for="(font, f_key) in chunk" v-bind:key="(c_key * 3) + f_key" v-on:download="download([font], font.name, 'single')" v-bind:fontname="font.name" v-bind:fontstyle="font.style" v-bind:fonturl="font.url" v-bind:sampletext="fontset.sampletext" v-bind:familyurl="font.familyUrl"></FontBox>
     </div>
 </template>
 
 <script>
 export default {
     name: "FontSetContainer",
-    props: ['fontset'],
+    props: ['fontset', 'downloading'],
     emits: ['download'],
     methods: {
-        download(fonts, family_name) {
-            this.$emit('download', fonts, family_name)
+        download(fonts, family_name, mode) {
+            if (this.downloading) return
+            this.$emit('download', fonts, family_name, mode)
         },
         getFontsInChunks: function(chunkSize_) {
             let output = []
