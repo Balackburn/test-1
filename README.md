@@ -1,74 +1,83 @@
-# YTLitePlus
+![TypeRip Logo](https://raw.githubusercontent.com/CodeZombie/TypeRip/master/src/assets/typerip_logo_small.png)
+### The [Adobe Fonts](https://fonts.adobe.com/) ripper.
 
-A patched YouTube IPA with tweaks injected — built entirely from `config.yml`.
+A browser-based tool that lets you preview and download the fonts Adobe Fonts
+(formerly TypeKit) makes publicly available. Built with Vite + Vue 3 and hosted
+as a static site on GitHub Pages.
 
-## How It Works
+### How to use it
+  1. Enter an Adobe Fonts [font family](https://fonts.adobe.com/fonts) or [font collection](https://fonts.adobe.com/collections) URL into the address bar, then press enter.
+  2. Browse the available fonts under this family, using the download button to save them to your machine.
+  3. That's it.
 
-1. **`config.yml`** — single source of truth. Every tweak is an entry with a repo, fetch method, and enabled flag.
-2. **`lib.sh`** — shared logic for fetching tweaks, patching the IPA, and applying customization.
-3. **`build.sh`** — local build script. Sources `lib.sh`.
-4. **`.github/workflows/build.yml`** — CI workflow. Same pipeline via `lib.sh`, outputs a GitHub Release.
+### Terms
+* Do not use any downloaded fonts for anything other than testing purposes. Think of it like a try-before-you-buy system. This tool merely saves a copy of what Adobe makes publicly available through their website, but this does not give you the _legal right_ to use the fonts as if you have purchased a license. If you want to publish any work using these fonts, or do _anything_ restricted to license-holders by said license, you _must_ purchase a license through Adobe.
 
-## Quick Start (Local)
+---
+
+## Running locally
 
 ```bash
-# Provide a decrypted YouTube IPA
-./build.sh /path/to/YouTube.ipa
-
-# Or pass a URL
-./build.sh https://example.com/YouTube.ipa
-
-# Or place a single .ipa in the project root and run:
-./build.sh
+npm install
+npm run dev      # start the dev server
+npm run build    # produce a production build in dist/
+npm run preview  # serve the production build locally
 ```
 
-Output: `YouTube-patched.ipa`
+## Deploying to GitHub Pages
 
-### Dependencies
+This repo ships a GitHub Actions workflow ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml))
+that builds the app and publishes `dist/` to GitHub Pages on every push to the
+default branch.
 
-- `curl`, `jq`, `python3` (with `pyyaml`), `unzip`, `zip`
-- `cyan` ([pyzule-rw](https://github.com/asdfzxcvbn/pyzule-rw)) for dylib injection and signing
-- `make` + Theos (only if any tweak has `fetch: build`)
+**One-time setup:** in the repository, go to **Settings → Pages → Build and
+deployment** and set **Source** to **GitHub Actions**. After the next push the
+workflow runs and the site goes live at `https://<user>.github.io/<repo>/`.
 
-## How to Add a Tweak
+The Vite `base` is set to `./` (relative paths), so the build works from that
+project subpath as well as from a custom domain. You can also run
+`npm run deploy` to publish to a `gh-pages` branch instead if you prefer that
+flow.
 
-Add an entry to `config.yml`:
+## About CORS proxies (the "#007" error)
 
-```yaml
-tweaks:
-  - id: my_new_tweak
-    enabled: true
-    repo: owner/RepoName
-    fetch: release        # or "build" for source-build tweaks
+Adobe Fonts pages don't send CORS headers, so a browser can't read them
+directly. TypeRip routes the page request through a **CORS proxy** that mirrors
+the response with permissive headers. The error
+
+> Request Failed — All CORS proxies failed. (#007)
+
+means every proxy TypeRip tried was unavailable at that moment. This build
+makes that error far less likely:
+
+* **A refreshed, working proxy list.** Dead/blocked proxies were removed and
+  `corsproxy.io` is tried first — its free tier allow-lists `*.github.io`
+  origins, which is exactly where this app is hosted.
+* **Correct request formatting.** Target URLs are now properly URL-encoded
+  (several proxies silently failed without this).
+* **Parallel racing with validation.** All proxies are tried at once and the
+  first response that actually looks like an Adobe Fonts page wins. A single
+  live proxy is enough to succeed, and one slow/dead proxy can no longer stall
+  the request. Each proxy also has a 20-second timeout.
+
+### Bullet-proofing it with your own proxy (optional)
+
+Public proxies are shared and can still be rate limited. To never see `#007`
+again, deploy the included [`cors-proxy-worker.js`](cors-proxy-worker.js) as a
+free Cloudflare Worker (instructions are in that file), then tell TypeRip to use
+it by running this once in your browser console on the TypeRip page:
+
+```js
+localStorage.setItem('typerip_custom_proxy', 'https://<your-worker>.workers.dev/?url=')
 ```
 
-That's it. No other files need to change.
+TypeRip races your proxy alongside the public ones, so a dedicated proxy will
+almost always win. Remove it with
+`localStorage.removeItem('typerip_custom_proxy')`.
 
-## CI (GitHub Actions)
+---
 
-Trigger the **Build YTLitePlus (v2)** workflow manually:
+### License
+typerip.js is released under the WTFPL (http://www.wtfpl.net/)
 
-- Provide a YouTube IPA URL as input, or set the `IPA_URL` repository secret.
-- A draft release with the patched IPA is created automatically.
-
-## Included Tweaks
-
-| Tweak | Repo | Enabled |
-|-------|------|---------|
-| YTLite | dayanch96/YTLite | ✅ |
-| YouPiP | PoomSmart/YouPiP | ✅ |
-| YTUHD | splaser/YTUHD | ✅ |
-| YTABConfig | PoomSmart/YTABConfig | ✅ |
-| Return YouTube Dislikes | PoomSmart/Return-YouTube-Dislikes | ✅ |
-| DontEatMyContent | therealFoxster/DontEatMyContent | ✅ |
-| YTVideoOverlay | PoomSmart/YTVideoOverlay | ✅ |
-| YouGroupSettings | PoomSmart/YouGroupSettings | ✅ |
-| Alderis | hbang/Alderis | ✅ |
-| FLEXing | PoomSmart/FLEXing | ❌ |
-| YouTimeStamp | aricloverALT/YouTimeStamp | ❌ |
-| YTHeaders | therealFoxster/YTHeaders | ❌ |
-| OpenYouTubeSafari | BillyCurtis/OpenYouTubeSafariExtension | ❌ |
-
-## License
-
-See [LICENSE](LICENSE).
+Originally created by [Jeremy Clark / CodeZombie](https://github.com/CodeZombie/TypeRip).
